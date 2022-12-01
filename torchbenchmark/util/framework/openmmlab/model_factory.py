@@ -5,6 +5,7 @@ from mmengine.registry import DefaultScope
 from mmengine.runner import Runner
 from torchbenchmark import DATA_PATH
 from torchbenchmark.util.model import BenchmarkModel
+import types
 from typing import Tuple, Generator, Optional
 
 
@@ -32,9 +33,11 @@ class OpenMMLabModel(BenchmarkModel):
         if test == 'train':
             data_loader = config.train_dataloader
             self.model.train()
+            self.forward_mode = 'loss'
         elif test == 'eval':
             data_loader = config.val_dataloader
             self.model.eval()
+            self.forward_mode = 'predict'
         data_loader.batch_size = self.batch_size
         with DefaultScope.overwrite_default_scope(scope):
             self.data_loader = Runner.build_dataloader(data_loader)
@@ -58,19 +61,20 @@ class OpenMMLabModel(BenchmarkModel):
         _modify(config.train_dataloader.dataset)
         _modify(config.val_dataloader.dataset)
 
-    def gen_inputs(self, num_batches:int=1) -> Tuple[Generator, Optional[int]]:
-        def _gen_inputs():
-            while True:
-                result = []
-                for _i in range(num_batches):
-                    result.append((torch.randn((self.batch_size, 3, 224, 224)).to(self.device),))
-                if self.dargs.precision == "fp16":
-                    result = list(map(lambda x: (x[0].half(), ), result))
-                yield result
-        return (_gen_inputs(), None)
-
     def get_module(self):
-        return self.model, (self.example_inputs,)
+        # Currently some OpenMMLab `data_preprocessor` failed dynamo, so we
+        # apply it before forward
+        # TODO(C1rN09): remove this logic if data_preprocessor is supported
+        example_inputs = self.model.data_preprocessor(self.example_inputs, True)
+        example_inputs['mode'] = self.forward_mode
+        # Replace forward function to be compatible with dynamo benchmark
+        self.model._old_forward = self.model.forward
+        def _new_forward(self, *args, **kwargs):
+            assert len(args) == 1 and isinstance(args[0], dict)
+            data = args[0]
+            return self._old_forward(**data, **kwargs)
+        self.model.forward = types.MethodType(_new_forward, self.model)
+        return self.model, (example_inputs,)
 
     def train(self):
         self.optimizer.zero_grad()
